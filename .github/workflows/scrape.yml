@@ -1,0 +1,91 @@
+name: Scrape MLBB Patch Stats
+
+# Two triggers, two strictly separate purposes:
+# - schedule: unattended daily archive, unlabeled (patch_id/patch_date blank), written to
+#   data/daily/ only. Never touches data/patches.csv or data/train.csv.
+# - workflow_dispatch: the ONLY way a new patch gets recorded in data/patches.csv. Requires a
+#   human to type in patch_id/patch_date -- the script never guesses them.
+on:
+  schedule:
+    - cron: "0 15 * * *" # 15:00 UTC = 22:00 WIB
+  workflow_dispatch:
+    inputs:
+      patch_id:
+        description: "Patch version, e.g. 2.1.92"
+        required: true
+      patch_date:
+        description: "Patch release date, YYYY-MM-DD"
+        required: true
+      nerfed:
+        description: "Pipe-separated nerfed heroes (optional, e.g. Baxia|Akai). Leave blank to fill in later."
+        required: false
+        default: ""
+      buffed:
+        description: "Pipe-separated buffed heroes (optional)."
+        required: false
+        default: ""
+      rank:
+        description: "Rank bracket to scrape"
+        required: false
+        default: "mythic"
+        type: choice
+        options:
+          - mythic
+          - mythical_glory
+          - mythical_honor
+          - legend
+          - epic
+
+permissions:
+  contents: write
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Playwright browsers
+        run: playwright install --with-deps chromium
+
+      # Cron runs only ever produce an unlabeled daily archive file. This never touches
+      # data/patches.csv or data/train.csv.
+      - name: Scrape daily snapshot (schedule only)
+        if: github.event_name == 'schedule'
+        run: python scripts/scraper.py daily --output-dir data/daily
+
+      # Recording a patch is exclusive to workflow_dispatch. patch_id/patch_date always come from
+      # the human-filled workflow inputs -- never guessed.
+      - name: Record labeled patch (workflow_dispatch only)
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          python scripts/scraper.py labeled \
+            --patch-id "${{ inputs.patch_id }}" \
+            --patch-date "${{ inputs.patch_date }}" \
+            --nerfed "${{ inputs.nerfed }}" \
+            --buffed "${{ inputs.buffed }}" \
+            --rank "${{ inputs.rank }}" \
+            --daily-dir data/daily \
+            --patches-csv data/patches.csv
+
+      - name: Commit updated data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/daily data/patches.csv
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            MSG="Record MLBB patch ${{ inputs.patch_id }}"
+          else
+            MSG="Add MLBB daily snapshot $(date -u +%Y-%m-%d)"
+          fi
+          git diff --cached --quiet || git commit -m "$MSG"
+          git push
