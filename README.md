@@ -40,6 +40,7 @@ do is in there, and the header always shows the real state of the archive:
                         9  model report
   PREDICT              10  forecast nerf candidates       11  forecast with options
                        12  baseline heuristic only
+  VALIDATE             18  back-test against shipped patches
   INSPECT              13  archive health and coverage     14  hero deep-dive
                        15  compare two dates
   SETUP                16  install dependencies           17  run the self-test
@@ -54,17 +55,34 @@ then checks the whole pipeline against a synthetic archive, offline, without tou
 
 ## What it predicts, and how honest it is
 
-**The headline caveat, read this first:** as of the latest commit there are **zero trainable
-patch windows**, so the machine-learning model *cannot be trained yet*. The archive holds a
-month of snapshots, but all of them fall inside patch 2.1.90's window, and a window only becomes
-training data once the patch *after* it is recorded with its nerf list. Option 6 shows this
-plainly per patch. Until that changes:
+**Where this actually stands.** The patch calendar now covers 2.1.95 (2026-08-04), 2.1.95a
+(2026-08-26) and 2.2.16 (2026-09-16), which splits the archive into **2 trainable windows** —
+just enough to train. A model exists. But its honest scores are weak, and the back-test
+(option 18) says something uncomfortable that is worth reading before trusting any of this:
 
-- **Option 10 still works.** It falls back to the `trend` engine, which needs no labels.
-- **To unlock the model**, record the patches that have shipped since 2.1.90 (option 4 by hand,
-  or option 5 to read them off the official notes). Each recorded patch with a nerf list turns
-  the window before it into training rows. Two windows is the minimum to train; four or more
-  before the cross-validation scores mean much.
+```
+2.1.95a -> 2.2.16   snapshot 2026-09-12, 5 heroes actually nerfed
+  baseline  3/5 in top 10   Hanabi#1, Miya#2, Paquito#6, Melissa#14, Yi Sun-shin#16
+  trend     2/5 in top 10   Miya#1, Hanabi#2, Melissa#12, Paquito#23, Yi Sun-shin#24
+  model     2/5 in top 10   Hanabi#6, Paquito#8, Miya#12, Melissa#29, Yi Sun-shin#36
+```
+
+On the only window with enough nerfs to measure, the **original two-term heuristic beat both of
+the additions**. Three findings follow, and none of them are flattering:
+
+1. The signal is real. All five nerfed heroes land in the top ~24 of 133 under either heuristic,
+   from a snapshot taken four days before the patch, with no knowledge of it.
+2. The `trend` engine's momentum term is miscalibrated. It demoted Paquito from #6 to #23
+   because his ban rate was *falling* — and he was nerfed anyway. A cooling hero is not a safe
+   hero, and that term currently assumes otherwise.
+3. The model is underpowered, not wrong in principle. Leave-one-patch-out on two windows means
+   it trains on a single window containing one positive hero (Atlas, a high-ban tank), so it
+   learned "high ban rate" and little else.
+
+The fix for all three is the same: more recorded patches. Two windows is the minimum to train at
+all; four or more before the cross-validation numbers mean anything. **Collection also stopped
+on 2026-09-12**, so the current patch (2.2.16) has zero snapshots and the tool cannot predict
+the *next* patch until collection resumes — start with option 1 or 2.
 
 Three prediction engines, chosen with option 11 or `--engine`:
 
@@ -75,10 +93,9 @@ Three prediction engines, chosen with option 11 or `--engine`:
 | `model` | **yes** | a classifier fitted on the archive across ~60 trend features, returning a probability per hero |
 | `auto` | — | `model` if one is trained, otherwise `trend` |
 
-`baseline` is kept deliberately so you can always see what the extra machinery adds. On the
-current archive, the trend engine promotes Hilda (ban rate +4.8 in a week) and Hirara into the
-top 10 and demotes Paquito and Rafaela, whose numbers are falling — movement the single-day
-heuristic is blind to by construction.
+`baseline` is kept deliberately so you can always see what the extra machinery adds — and right
+now, on the one measurable window, it adds nothing. Keep comparing with option 12 and option 18
+rather than assuming the more complex engine is better.
 
 The `trend` engine's extra weights are unvalidated guesses, exactly like the baseline's
 0.45/0.55. That's the point of the `model` engine: learn them instead of guessing. Both engines
@@ -98,7 +115,19 @@ heroes, read the top 10. Rows are weighted so every patch window counts equally 
 how many days were collected during it.
 
 Option 9 prints the scores, the caveat when there are too few windows, and which features the
-model keys on.
+model keys on. **Option 18 back-tests every engine against patches that already shipped** —
+taking the last snapshot before each patch landed and reporting where the heroes that really got
+nerfed came out. The model is scored leave-one-patch-out there, so it never grades a window it
+trained on. That option, not the CV printout, is the one to believe.
+
+### A label trap worth knowing about
+
+A patch row with an empty `heroes_nerfed` list is ambiguous: it can mean "this patch nerfed
+nobody" or "nobody has transcribed it yet". `dataset.py` treats it as the second, leaves the
+window **unlabeled**, and warns — because reading it the other way turns a whole window of
+heroes into confident negatives that teach the model the opposite of the truth, silently. Heroes
+listed as *adjusted* in the patch notes go in neither list for the same reason: the notes
+distinguish adjust from nerf, so inventing a label either way would be guessing.
 
 ## Unlimited tracking
 
@@ -134,6 +163,7 @@ mlbb-nerf-predictor/
 │   ├── forecast.py                # ranked nerf candidates, model|trend|baseline
 │   ├── predict.py                 # the original heuristic (unchanged -- see note below)
 │   ├── patchnotes.py              # read official patch notes -> proposed patches.csv rows
+│   ├── backtest.py                # score past windows against what really got nerfed
 │   ├── trends.py                  # hero history, date comparison, data health
 │   └── selftest.py                # end-to-end check on a synthetic archive, offline
 ├── data/
@@ -224,6 +254,10 @@ python scripts/forecast.py                                  # auto engine, lates
 python scripts/forecast.py --engine trend --rank mythical_glory --top 20
 python scripts/forecast.py --engine baseline --date 2026-08-22
 python scripts/predict.py                                   # the original, untouched
+
+# Validate against patches that already shipped
+python scripts/backtest.py
+python scripts/backtest.py --engines baseline,trend --k 5
 
 # Inspect the archive
 python scripts/trends.py health

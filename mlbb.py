@@ -484,6 +484,23 @@ def _run_forecast(engine: str, rank: str | None = None, date: str | None = None,
         print(green(f"\n  Wrote {forecast.write_markdown(ranked, meta)}"))
 
 
+def act_backtest() -> None:
+    """Score past patch windows against the heroes that actually got nerfed."""
+    import backtest
+    print(dim("  Takes the last snapshot before each patch landed, ranks every hero, and shows\n"
+              "  where the heroes that really got nerfed came out. The model is scored\n"
+              "  leave-one-patch-out, so it never grades a window it trained on.\n"))
+    k = ask_int("  Top-k to score", backtest.DEFAULT_K)
+    print()
+    try:
+        res = backtest.run(k=k)
+    except RuntimeError as exc:
+        print(red(f"  {exc}"))
+        return
+    for line in backtest.format_report(res).splitlines():
+        print("  " + line)
+
+
 def act_health() -> None:
     """Collection coverage, gaps and anything odd in the archive."""
     import trends
@@ -605,6 +622,9 @@ SECTIONS = [
         Item("10", "Forecast nerf candidates", act_forecast_quick),
         Item("11", "Forecast with options (engine, rank, date)", act_forecast_custom),
         Item("12", "Baseline heuristic only (original predict.py)", act_forecast_baseline),
+    ]),
+    Section("VALIDATE", [
+        Item("18", "Back-test against patches that already shipped", act_backtest),
     ]),
     Section("INSPECT", [
         Item("13", "Archive health and coverage", act_health),

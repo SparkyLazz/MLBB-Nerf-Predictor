@@ -1,3 +1,6 @@
 patch_id,release_date,heroes_nerfed,heroes_buffed,notes
 2.1.88,2026-06-17,,,Season 41 Scarlet Embers
 2.1.90,2026-07-08,Baxia|Fredrinn|Akai|Zhuxin,Esmeralda|Nolan|Aulus|Minsitthar|Argus|Melissa,mid-season revision
+2.1.95,2026-08-04,,,Season 42; Kaja revamp. Date corroborated by archive discontinuity (ban-rate shift 10x median on 2026-08-04). Nerf/buff lists not yet transcribed.
+2.1.95a,2026-08-26,Atlas,Hayabusa|Obsidia,"Hotfix (2 buffs, 1 nerf, 1 adjustment). Search-derived, corroborated in archive: Atlas win% -0.95 and Hanzo -2.25 at 2026-08-26. Hanzo listed as adjust, not nerf, so excluded from heroes_nerfed. VERIFY against official notes."
+2.2.16,2026-09-16,Melissa|Miya|Hanabi|Yi Sun-shin|Paquito,Cici|Alpha|Kagura|Edith|Karina|Kaja,"Hero lists supplied by repo owner from the patch notes. Adjusted (neither nerf nor buff, so excluded from both lists): Aulus|Argus|Aldous|Lukas|Odette|Sun|Marcel|Kadita|Hylos. 'Yi Shun Shin' normalised to roster spelling 'Yi Sun-shin'."
