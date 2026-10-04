@@ -241,6 +241,72 @@ def _click_rank_filter(page: "Page", rank_label: str, timeout_ms: int) -> None:
     )
 
 
+
+# Second-stage probe: the table's real shape, and what the rank dropdown contains once opened.
+# The first probe says "the markup changed"; these two say "and here is exactly what to parse".
+_TABLE_JS = r"""
+() => {
+  const squash = t => (t || '').replace(/\s+/g, ' ').trim();
+  return Array.from(document.querySelectorAll('table')).map(t => {
+    const head = Array.from(t.querySelectorAll('thead th, thead td')).map(c => squash(c.innerText));
+    const bodyRows = Array.from(t.querySelectorAll('tbody tr'));
+    return {
+      cls: squash((t.className || '').toString()).slice(0, 80),
+      rows: bodyRows.length,
+      head,
+      sample: bodyRows.slice(0, 3).map(tr => ({
+        cells: Array.from(tr.children).map(c => squash(c.innerText)),
+        imgs: Array.from(tr.querySelectorAll('img[alt]')).map(i => i.alt),
+        html: tr.outerHTML.slice(0, 900),
+      })),
+    };
+  });
+}
+"""
+
+_MENU_JS = r"""
+() => {
+  const squash = t => (t || '').replace(/\s+/g, ' ').trim();
+  const visible = el => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const sel = '[role="option"],[role="menuitem"],[role="menuitemradio"],[role="radio"],li,button,a,div[data-value]';
+  const items = [];
+  for (const el of document.querySelectorAll(sel)) {
+    if (!visible(el)) continue;
+    const t = squash(el.innerText);
+    if (!t || t.length > 30) continue;
+    items.push({
+      tag: el.tagName.toLowerCase(), role: el.getAttribute('role'), text: t,
+      cls: squash((el.className || '').toString()).slice(0, 70),
+      data: Object.keys(el.dataset || {}).slice(0, 5),
+    });
+  }
+  return items.slice(0, 70);
+}
+"""
+
+# The redesigned page puts each filter behind a dropdown whose trigger shows "<name> <current
+# value>" -- e.g. "Rank All Ranks". Opening it is a separate step from choosing a value.
+_FILTER_TRIGGERS = (
+    'button:has-text("{name}")',
+    '[aria-label*="{name}"]',
+    '[role="combobox"]:has-text("{name}")',
+)
+
+
+def _open_filter_menu(page: "Page", name: str, timeout_ms: int = 4_000) -> bool:
+    """Click the dropdown trigger for a named filter (Rank / Window / Role / Lane)."""
+    for pattern in _FILTER_TRIGGERS:
+        try:
+            trigger = page.locator(pattern.format(name=name)).first
+            trigger.wait_for(state="visible", timeout=timeout_ms)
+            trigger.click()
+            page.wait_for_timeout(700)
+            return True
+        except Exception:
+            continue
+    return False
+
+
 def diagnose(headless: bool = True, timeout_ms: int = 30_000, dump_html: str | None = None) -> dict:
     """Open the stats page and report what it offers, without writing anything.
 
@@ -262,6 +328,9 @@ def diagnose(headless: bool = True, timeout_ms: int = 30_000, dump_html: str | N
             page.goto(STATS_URL, wait_until="domcontentloaded", timeout=timeout_ms)
             page.wait_for_timeout(2500)
             probe = page.evaluate(_PROBE_JS)
+            probe["tables"] = page.evaluate(_TABLE_JS)
+            probe["rank_menu_opened"] = _open_filter_menu(page, "Rank")
+            probe["rank_menu"] = page.evaluate(_MENU_JS) if probe["rank_menu_opened"] else []
             if dump_html:
                 os.makedirs(os.path.dirname(dump_html) or ".", exist_ok=True)
                 with open(dump_html, "w", encoding="utf-8") as f:
@@ -272,6 +341,23 @@ def diagnose(headless: bool = True, timeout_ms: int = 30_000, dump_html: str | N
 
     print(f"Diagnostic probe of {STATS_URL}\n")
     print(_format_probe(probe))
+
+    for i, table in enumerate(probe.get("tables", [])):
+        print(f"\n  <table {i}> class={table['cls']!r}, {table['rows']} body row(s)")
+        print(f"    header cells: {table['head']}")
+        for j, row in enumerate(table["sample"]):
+            print(f"    row {j} cells: {row['cells']}")
+            print(f"    row {j} img alts: {row['imgs']}")
+            if j == 0:
+                print(f"    row 0 html: {row['html'][:700]}")
+
+    if probe.get("rank_menu_opened"):
+        print(f"\n  Rank dropdown opened; visible short-text items ({len(probe['rank_menu'])}):")
+        for item in probe["rank_menu"]:
+            print(f"    <{item['tag']} role={item['role']!r}> {item['text']!r} "
+                  f"class={item['cls']!r} data={item['data']}")
+    else:
+        print("\n  Could not open a 'Rank' filter dropdown.")
     print()
     if probe["knownContainerFound"] and probe["exactRankText"]:
         print("Both the rank labels and the stats container are present -- a scrape should work.")
