@@ -5,3 +5,9 @@ venv/
 .env
 .DS_Store
 .ipynb_checkpoints/
+
+# Derived artifacts -- rebuilt from data/daily/ + data/archive/ + data/patches.csv on demand.
+# data/train.csv is committed (small, one row per hero per patch); these are not.
+data/.cache/
+data/features.csv
+models/

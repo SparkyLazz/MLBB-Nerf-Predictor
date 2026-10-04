@@ -8,6 +8,12 @@ orchestration changed, to fit this repo's architecture:
   append-only -- this NEVER overwrites or deletes an existing file for that date, and there is no
   --force escape hatch for it (unlike the old prototype). This is the only thing the scheduled
   cron trigger ever runs.
+- `snapshot`: the unlimited-collection mode. Scrapes one or many rank brackets in a single run
+  and writes each to data/archive/<rank>/<UTC timestamp>.csv -- any number of snapshots per day,
+  any rank, kept forever. With --every it keeps collecting on an interval until stopped. For the
+  Mythic bracket it also mirrors to data/daily/<date>.csv when that file doesn't exist yet, so
+  the legacy layout and everything reading it stays correct. Still append-only: a file that has
+  landed is never rewritten.
 - `labeled`: the ONLY way a new row gets added to data/patches.csv, which is the hand-curated
   patch calendar (release dates + nerf/buff hero lists) that scripts/promote.py joins against
   data/daily/ to build data/train.csv. patch_id/patch_date (and heroes_nerfed/heroes_buffed, if
@@ -20,6 +26,12 @@ scripts/promote.py.
 
 The mean-win-rate validation lives in fetch_stats() itself (the fetch path), not in either
 save function, so there is no way to save data without going through it.
+
+Roster-size check: a count BELOW MIN_HERO_COUNT still fails hard -- that is the signature of a
+half-rendered page or a broken selector, and writing it would poison the archive. A count ABOVE
+it that merely differs from EXPECTED_HERO_COUNT now warns instead of failing, because Moonton
+shipping hero 134 should not silently stop daily collection for however long it takes someone to
+notice and bump a constant. Override the floor with MLBB_MIN_HERO_COUNT if you need to.
 """
 
 from __future__ import annotations
@@ -28,17 +40,25 @@ import argparse
 import csv
 import os
 import sys
+import time
 from datetime import datetime, timezone
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import pandas as pd
-from playwright.sync_api import Page, sync_playwright
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import store  # noqa: E402
+
+if TYPE_CHECKING:  # Playwright is imported lazily inside fetch_stats() -- see below.
+    from playwright.sync_api import Page
 
 STATS_URL = "https://mlbbhub.com/statistics"
-EXPECTED_HERO_COUNT = 133  # sanity check; bump this if Moonton ships a new hero
+EXPECTED_HERO_COUNT = 133  # informational: a different count warns, it no longer halts collection
+MIN_HERO_COUNT = int(os.environ.get("MLBB_MIN_HERO_COUNT", "125"))  # below this the scrape is broken, not new
 WIN_RATE_MEAN_BOUNDS = (48.0, 52.0)  # every match has one winner and one loser -> average should hover ~50%
 
 DAILY_DIR_DEFAULT = "data/daily"
+ARCHIVE_DIR_DEFAULT = store.ARCHIVE_DIR
 PATCHES_DEFAULT = "data/patches.csv"
 PATCHES_COLUMNS = ["patch_id", "release_date", "heroes_nerfed", "heroes_buffed", "notes"]
 
@@ -51,6 +71,7 @@ RANK_LABELS: dict[str, str] = {
     "mythical_honor": "Mythical Honor",
     "mythical_glory": "Mythical Glory",
 }
+assert tuple(RANK_LABELS) == store.RANKS, "RANK_LABELS must stay in sync with store.RANKS"
 
 # Verified interactively against the live site -- kept as one block so it's trivial to diff
 # against that transcript if the site layout ever changes.
@@ -79,7 +100,7 @@ _EXTRACT_JS = r"""
 """
 
 
-def _click_rank_filter(page: Page, rank_label: str, timeout_ms: int) -> None:
+def _click_rank_filter(page: "Page", rank_label: str, timeout_ms: int) -> None:
     button = page.get_by_role("button", name=rank_label, exact=True)
     button.wait_for(state="visible", timeout=timeout_ms)
     button.click()
@@ -103,6 +124,17 @@ def fetch_stats(
     if rank not in RANK_LABELS:
         raise ValueError(f"rank must be one of {list(RANK_LABELS)}, got {rank!r}")
     rank_label = RANK_LABELS[rank]
+
+    # Imported here, not at module scope, so recording a patch by hand and reading the archive
+    # work on a machine that has never installed Playwright or its browsers.
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise RuntimeError(
+            "Playwright is not installed, so stats cannot be scraped. Run "
+            "`pip install -r requirements.txt && playwright install --with-deps chromium` "
+            "(menu option 16)."
+        ) from exc
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
@@ -135,11 +167,17 @@ def fetch_stats(
 
     if df.empty:
         raise RuntimeError("Scrape returned zero hero rows -- page structure may have changed.")
-    if len(df) != EXPECTED_HERO_COUNT:
+    if len(df) < MIN_HERO_COUNT:
         raise RuntimeError(
-            f"Expected {EXPECTED_HERO_COUNT} heroes, got {len(df)}. "
-            "Hero roster or DOM structure may have changed -- check before trusting this data "
-            "(update EXPECTED_HERO_COUNT once you've confirmed it's a real roster change, not a scrape bug)."
+            f"Only {len(df)} heroes scraped, below the floor of {MIN_HERO_COUNT}. That is a "
+            "half-rendered page or a changed selector, not a roster change -- refusing to write. "
+            "(Override the floor with MLBB_MIN_HERO_COUNT if the roster really did shrink.)"
+        )
+    if len(df) != EXPECTED_HERO_COUNT:
+        print(
+            f"NOTE: scraped {len(df)} heroes, expected {EXPECTED_HERO_COUNT} -- probably a new hero. "
+            f"Collection continues; bump EXPECTED_HERO_COUNT in {os.path.basename(__file__)} to silence this.",
+            file=sys.stderr,
         )
     if df[["name", "role", "win", "pick", "ban"]].isnull().any().any():
         bad = df[df[["name", "role", "win", "pick", "ban"]].isnull().any(axis=1)]
@@ -197,6 +235,75 @@ def save_daily_snapshot(
     return out_path
 
 
+def _write_snapshot_csv(df: pd.DataFrame, out_path: str) -> None:
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    out = df.copy()
+    out.insert(0, "patch_date", "")
+    out.insert(0, "patch_id", "")
+    out["nerfed_next"] = ""
+    out[store.SNAPSHOT_COLUMNS].to_csv(out_path, index=False)
+
+
+def save_snapshot(
+    ranks: list[str] | tuple[str, ...] = (store.DEFAULT_RANK,),
+    archive_dir: str = ARCHIVE_DIR_DEFAULT,
+    daily_dir: str = DAILY_DIR_DEFAULT,
+    headless: bool = True,
+    mirror_daily: bool = True,
+    once_per_day: bool = False,
+) -> list[str]:
+    """Scrape each requested rank and archive it. Returns the paths written.
+
+    One archive file per rank per run, stamped to the second, so there is no per-day cap on how
+    often this can run -- that is the point of this mode. Mythic additionally mirrors into the
+    legacy data/daily/<date>.csv when that day has no file yet, which keeps promote.py,
+    train.csv and the existing archive readable exactly as before.
+
+    A rank that fails to scrape does not abort the others: its error is reported and the run
+    continues, so one flaky bracket never costs a whole day of collection across the rest.
+    """
+    written: list[str] = []
+    failures: list[tuple[str, str]] = []
+    when = store.utc_now()
+    today = when.date().isoformat()
+
+    for rank in ranks:
+        if once_per_day:
+            already = [r for r in store.iter_refs(ranks=(rank,), include_legacy=False) if r.date == today]
+            if already:
+                print(f"[{rank}] already archived today ({already[-1].path}), skipping (--once-per-day).")
+                continue
+        try:
+            df = fetch_stats(rank=rank, headless=headless)
+        except (RuntimeError, ValueError) as exc:
+            print(f"[{rank}] ERROR: {exc}", file=sys.stderr)
+            failures.append((rank, str(exc)))
+            continue
+
+        out_path = store.archive_path(rank, when=when, archive_dir=archive_dir)
+        if os.path.exists(out_path):
+            print(f"[{rank}] {out_path} already exists, leaving it untouched (append-only).")
+        else:
+            _write_snapshot_csv(df, out_path)
+            written.append(out_path)
+            print(f"[{rank}] wrote {len(df)} rows -> {out_path}")
+
+        if mirror_daily and rank == store.DEFAULT_RANK:
+            legacy = os.path.join(daily_dir, f"{today}.csv")
+            if os.path.exists(legacy):
+                print(f"[{rank}] {legacy} already exists -- data/daily/ is append-only, leaving it untouched.")
+            else:
+                _write_snapshot_csv(df, legacy)
+                written.append(legacy)
+                print(f"[{rank}] mirrored -> {legacy}")
+
+    if failures and not written:
+        raise RuntimeError(
+            "Every rank failed: " + "; ".join(f"{r}: {e.splitlines()[0]}" for r, e in failures)
+        )
+    return written
+
+
 def append_patch_record(
     patches_csv: str,
     patch_id: str,
@@ -248,6 +355,34 @@ def main() -> None:
     daily_parser.add_argument("--output-dir", default=DAILY_DIR_DEFAULT)
     daily_parser.add_argument("--no-headless", action="store_true", help="Run with a visible browser (local debugging only).")
 
+    snap_parser = subparsers.add_parser(
+        "snapshot",
+        help="Unlimited collection: archive one or many ranks to data/archive/, optionally on a repeating interval.",
+    )
+    snap_parser.add_argument(
+        "--ranks", default=store.DEFAULT_RANK,
+        help='Comma-separated ranks, or "all" for every bracket. Default: mythic.',
+    )
+    snap_parser.add_argument("--archive-dir", default=ARCHIVE_DIR_DEFAULT)
+    snap_parser.add_argument("--daily-dir", default=DAILY_DIR_DEFAULT)
+    snap_parser.add_argument(
+        "--no-mirror-daily", action="store_true",
+        help="Don't also write the legacy data/daily/<date>.csv for the Mythic bracket.",
+    )
+    snap_parser.add_argument(
+        "--once-per-day", action="store_true",
+        help="Skip a rank that already has an archive snapshot today (for idempotent cron runs).",
+    )
+    snap_parser.add_argument(
+        "--every", type=float, metavar="MINUTES",
+        help="Keep collecting every MINUTES minutes instead of exiting after one pass.",
+    )
+    snap_parser.add_argument(
+        "--count", type=int, default=0, metavar="N",
+        help="With --every: stop after N passes. 0 (default) means run until interrupted.",
+    )
+    snap_parser.add_argument("--no-headless", action="store_true", help="Run with a visible browser (local debugging only).")
+
     labeled_parser = subparsers.add_parser(
         "labeled",
         help="Record a new patch in data/patches.csv, plus a same-day daily snapshot. "
@@ -270,6 +405,34 @@ def main() -> None:
     try:
         if args.mode == "daily":
             save_daily_snapshot(output_dir=args.output_dir, rank=args.rank, headless=not args.no_headless)
+        elif args.mode == "snapshot":
+            ranks = list(store.RANKS) if args.ranks == "all" else [r.strip() for r in args.ranks.split(",") if r.strip()]
+            unknown = [r for r in ranks if r not in RANK_LABELS]
+            if unknown:
+                raise RuntimeError(f"Unknown rank(s) {unknown}; choose from {list(RANK_LABELS)} or 'all'.")
+
+            passes = 0
+            while True:
+                passes += 1
+                if args.every:
+                    print(f"--- pass {passes}{f' of {args.count}' if args.count else ''} "
+                          f"at {store.utc_now().strftime('%Y-%m-%d %H:%M:%S')} UTC ---")
+                save_snapshot(
+                    ranks=ranks,
+                    archive_dir=args.archive_dir,
+                    daily_dir=args.daily_dir,
+                    headless=not args.no_headless,
+                    mirror_daily=not args.no_mirror_daily,
+                    once_per_day=args.once_per_day,
+                )
+                if not args.every or (args.count and passes >= args.count):
+                    break
+                print(f"Sleeping {args.every:g} min; Ctrl-C to stop.")
+                try:
+                    time.sleep(args.every * 60)
+                except KeyboardInterrupt:
+                    print("\nStopped. Everything already collected is on disk.")
+                    break
         else:  # labeled
             if not args.no_daily_snapshot:
                 save_daily_snapshot(output_dir=args.daily_dir, rank=args.rank, headless=not args.no_headless)
