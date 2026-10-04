@@ -568,11 +568,19 @@ def fetch_stats(
             page.goto(STATS_URL, wait_until="domcontentloaded", timeout=timeout_ms)
             _click_rank_filter(page, rank_label, timeout_ms)
 
-            # Wait for the filtered table to actually contain rows, not just for the click to register.
+            # Wait for the filtered table to actually contain rows, not just for the click to
+            # register. Accepts either layout -- the redesigned <table> or the pre-redesign
+            # container -- because this gate has to agree with whichever extractor will run.
+            # (It previously checked only the old container, so it timed out on the new page even
+            # though rank selection and extraction were both working.)
             page.wait_for_function(
                 r"""() => {
-                    const c = document.querySelector('.md\\:hidden.space-y-\\[2px\\]');
-                    return !!c && c.children.length > 0;
+                    const legacy = document.querySelector('.md\\:hidden.space-y-\\[2px\\]');
+                    if (legacy && legacy.children.length > 0) return true;
+                    for (const t of document.querySelectorAll('table')) {
+                        if (t.querySelectorAll('tbody tr').length > 0) return true;
+                    }
+                    return false;
                 }""",
                 timeout=timeout_ms,
             )
