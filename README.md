@@ -55,6 +55,14 @@ then checks the whole pipeline against a synthetic archive, offline, without tou
 
 ## What it predicts, and how honest it is
 
+**Collection status.** Restored on 2026-10-04 after a 22-day outage (see "When collection
+stops"), and now gathering **all five rank brackets** instead of Mythic only — which switched on
+the cross-rank features for the first time. The 2026-08-04 → 2026-09-12 stretch is Mythic-only;
+everything from 2026-10-04 has all five. One consequence of the gap: 7- and 14-day deltas read
+as blank (not zero) for the resumed snapshot, and come back after about a week of daily
+collection. The trend engine also drops its persistence terms while fewer than three snapshots
+sit in the trailing fortnight, rather than calling one reading a fortnight-long pattern.
+
 **Where this actually stands.** The patch calendar now covers 2.1.95 (2026-08-04), 2.1.95a
 (2026-08-26) and 2.2.16 (2026-09-16), which splits the archive into **2 trainable windows** —
 just enough to train. A model exists. But its honest scores are weak, and the back-test

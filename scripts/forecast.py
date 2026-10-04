@@ -43,6 +43,13 @@ W_CONTEST_D7 = 0.15
 W_HOT_WR = 0.20
 W_HOT_BAN = 0.15
 
+# A "share of the last fortnight spent hot" computed from one or two snapshots is not
+# persistence, it is just the current reading wearing a persistence label -- and it would
+# double-count the level terms it sits next to. Below this many snapshots in the window, the
+# persistence terms are dropped and not cited as drivers. This bites after a collection outage:
+# the 22-day gap in this archive left exactly one snapshot in the trailing fortnight.
+MIN_SNAPS_FOR_PERSISTENCE = 3
+
 # Features the "drivers" column is allowed to cite, with human wording. Restricted on purpose:
 # a driver list is meant to be read by a person deciding whether to believe the ranking.
 DRIVER_LABELS = {
@@ -84,10 +91,11 @@ def trend_score(snap_features: pd.DataFrame) -> pd.Series:
         + W_BAN_D7 * _zfill(snap_features["ban_d7"])
         + W_CONTEST_D7 * _zfill(snap_features["contest_d7"])
     ) * conf
+    enough_history = snap_features["snaps_seen14"].fillna(0) >= MIN_SNAPS_FOR_PERSISTENCE
     persistence = (
         W_HOT_WR * snap_features["share_hot_wr14"].fillna(0.0)
         + W_HOT_BAN * snap_features["share_hot_ban14"].fillna(0.0)
-    )
+    ).where(enough_history, 0.0)
     return base.to_numpy() + momentum + persistence
 
 
@@ -102,9 +110,18 @@ def drivers(snap_features: pd.DataFrame, weights: dict[str, float], top: int = 3
     if not usable:
         return [""] * len(snap_features)
 
+    # Don't let a feature describe itself as a fortnight-long pattern on one snapshot.
+    if "snaps_seen14" in snap_features.columns:
+        thin = snap_features["snaps_seen14"].fillna(0) < MIN_SNAPS_FOR_PERSISTENCE
+    else:
+        thin = pd.Series(False, index=snap_features.index)
+
     contrib = pd.DataFrame(index=snap_features.index)
     for feat, w in usable.items():
-        contrib[feat] = _zfill(snap_features[feat]) * w
+        values = _zfill(snap_features[feat]) * w
+        if feat in ("share_hot_wr14", "share_hot_ban14"):
+            values = values.where(~thin, 0.0)
+        contrib[feat] = values
 
     out = []
     for idx in snap_features.index:
