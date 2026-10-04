@@ -268,19 +268,30 @@ _MENU_JS = r"""
 () => {
   const squash = t => (t || '').replace(/\s+/g, ' ').trim();
   const visible = el => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
-  const sel = '[role="option"],[role="menuitem"],[role="menuitemradio"],[role="radio"],li,button,a,div[data-value]';
+  // Only rank-relevant text. The previous version listed every visible button and hero link,
+  // which buried the answer under 60 lines of noise.
+  const KEY = /epic|legend|mythic|mythical|honor|glory|all ranks/i;
   const items = [];
+  const sel = '[role="option"],[role="menuitem"],[role="menuitemradio"],[role="radio"],li,button,a,div[data-value],span';
   for (const el of document.querySelectorAll(sel)) {
-    if (!visible(el)) continue;
+    if (!visible(el) || el.children.length > 2) continue;
     const t = squash(el.innerText);
-    if (!t || t.length > 30) continue;
+    if (!t || t.length > 30 || !KEY.test(t)) continue;
     items.push({
       tag: el.tagName.toLowerCase(), role: el.getAttribute('role'), text: t,
-      cls: squash((el.className || '').toString()).slice(0, 70),
+      cls: squash((el.className || '').toString()).slice(0, 60),
       data: Object.keys(el.dataset || {}).slice(0, 5),
     });
   }
-  return items.slice(0, 70);
+  // Whatever container is currently open -- Radix/Headless UI style popovers live in a portal.
+  const open = Array.from(document.querySelectorAll(
+      '[role="listbox"],[role="menu"],[role="dialog"],[data-state="open"],[aria-expanded="true"]'))
+    .map(el => ({ tag: el.tagName.toLowerCase(), role: el.getAttribute('role'),
+                  state: el.getAttribute('data-state'),
+                  text: squash(el.innerText).slice(0, 200),
+                  html: el.outerHTML.slice(0, 600) }))
+    .slice(0, 6);
+  return { items: items.slice(0, 25), open };
 }
 """
 
@@ -339,33 +350,36 @@ def diagnose(headless: bool = True, timeout_ms: int = 30_000, dump_html: str | N
         finally:
             browser.close()
 
-    print(f"Diagnostic probe of {STATS_URL}\n")
-    print(_format_probe(probe))
+    # Deliberate ordering: the two things needed to write new selectors (the table's real shape
+    # and the rank dropdown's contents) print LAST, because a CI log is usually read by its tail.
+    print(f"Diagnostic probe of {STATS_URL}")
+    print(f"  title={probe['title']!r}  bodyLen={probe['bodyLen']}  "
+          f"old container={'FOUND' if probe['knownContainerFound'] else 'GONE'}")
+    filters = [b for b in probe["buttons"] if any(
+        k in (b["text"] or "") for k in ("Rank", "Window", "Role", "Lane"))]
+    print(f"  filter-looking buttons: {[b['text'] for b in filters]}")
 
+    print("\n=== TABLES ===")
     for i, table in enumerate(probe.get("tables", [])):
-        print(f"\n  <table {i}> class={table['cls']!r}, {table['rows']} body row(s)")
-        print(f"    header cells: {table['head']}")
-        for j, row in enumerate(table["sample"]):
-            print(f"    row {j} cells: {row['cells']}")
-            print(f"    row {j} img alts: {row['imgs']}")
-            if j == 0:
-                print(f"    row 0 html: {row['html'][:700]}")
+        print(f"  <table {i}> class={table['cls']!r}  {table['rows']} body row(s)")
+        print(f"    headers : {table['head']}")
+        for j, row in enumerate(table["sample"][:2]):
+            print(f"    row{j} cells: {row['cells']}")
+            print(f"    row{j} alts : {row['imgs']}")
+        if table["sample"]:
+            print(f"    row0 html : {table['sample'][0]['html'][:600]}")
 
-    if probe.get("rank_menu_opened"):
-        print(f"\n  Rank dropdown opened; visible short-text items ({len(probe['rank_menu'])}):")
-        for item in probe["rank_menu"]:
-            print(f"    <{item['tag']} role={item['role']!r}> {item['text']!r} "
-                  f"class={item['cls']!r} data={item['data']}")
-    else:
-        print("\n  Could not open a 'Rank' filter dropdown.")
-    print()
-    if probe["knownContainerFound"] and probe["exactRankText"]:
-        print("Both the rank labels and the stats container are present -- a scrape should work.")
-    elif not probe["exactRankText"]:
-        print("The rank filter labels are gone. _click_rank_filter needs a new strategy.")
-    elif not probe["knownContainerFound"]:
-        print("Rank labels found but the stats container selector missed. _EXTRACT_JS needs updating "
-              "-- see the candidate containers above.")
+    print("\n=== RANK DROPDOWN ===")
+    menu = probe.get("rank_menu") or {}
+    print(f"  trigger clicked: {probe.get('rank_menu_opened')}")
+    for item in (menu.get("items") or []):
+        print(f"    <{item['tag']} role={item['role']!r}> {item['text']!r} "
+              f"class={item['cls']!r} data={item['data']}")
+    if not (menu.get("items") or []):
+        print("    no rank-named items visible after the click")
+    for o in (menu.get("open") or []):
+        print(f"    OPEN <{o['tag']} role={o['role']!r} state={o['state']!r}> text={o['text']!r}")
+        print(f"         html={o['html'][:400]}")
     return probe
 
 
