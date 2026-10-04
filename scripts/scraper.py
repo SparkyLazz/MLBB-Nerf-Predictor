@@ -100,10 +100,187 @@ _EXTRACT_JS = r"""
 """
 
 
+# Dumps whatever the page currently offers as a rank control. This exists because when the
+# filter selector broke, the scheduled job failed with nothing but "button 'Mythic' not visible"
+# -- true, but useless: it never said what the page DID have. Every failure now ends with this,
+# so one log read is enough to write the new selector.
+_PROBE_JS = r"""
+() => {
+  const LABELS = ['Epic','Legend','Mythic','Mythical Honor','Mythical Glory'];
+  const squash = t => (t || '').replace(/\s+/g, ' ').trim();
+  const describe = el => ({
+    tag: el.tagName.toLowerCase(),
+    role: el.getAttribute('role'),
+    text: squash(el.innerText).slice(0, 40),
+    aria: el.getAttribute('aria-label'),
+    cls: squash((el.className || '').toString()).slice(0, 90),
+    data: Object.keys(el.dataset || {}).slice(0, 6),
+  });
+
+  const buttons = Array.from(document.querySelectorAll('button')).map(describe);
+  const roles = Array.from(document.querySelectorAll('[role="tab"],[role="option"],[role="menuitem"],[role="radio"]')).map(describe);
+  const selects = Array.from(document.querySelectorAll('select')).map(s => ({
+    cls: squash((s.className || '').toString()).slice(0, 90),
+    options: Array.from(s.options).map(o => squash(o.textContent)).slice(0, 12),
+  }));
+
+  // Anything whose own text is exactly a rank name -- the likeliest new control, whatever its tag.
+  const exact = [];
+  for (const el of document.querySelectorAll('*')) {
+    if (el.children.length) continue;
+    const t = squash(el.textContent);
+    if (LABELS.includes(t)) exact.push({ ...describe(el), parentTag: el.parentElement ? el.parentElement.tagName.toLowerCase() : null,
+                                          parentCls: el.parentElement ? squash((el.parentElement.className || '').toString()).slice(0, 90) : null });
+  }
+
+  const container = document.querySelector('.md\\:hidden.space-y-\\[2px\\]');
+  // Fallback: any element with many same-shaped children looks like the stats table.
+  const bigLists = Array.from(document.querySelectorAll('div,ul,tbody'))
+    .filter(e => e.children.length >= 50)
+    .map(e => ({ cls: squash((e.className || '').toString()).slice(0, 90), children: e.children.length, tag: e.tagName.toLowerCase() }))
+    .slice(0, 8);
+
+  return {
+    title: document.title, url: location.href, bodyLen: document.body.innerText.length,
+    buttons: buttons.slice(0, 40), roles: roles.slice(0, 40), selects,
+    exactRankText: exact.slice(0, 20),
+    knownContainerFound: !!container,
+    knownContainerChildren: container ? container.children.length : 0,
+    bigLists,
+  };
+}
+"""
+
+
+def _format_probe(probe: dict) -> str:
+    lines = [
+        f"  page title : {probe['title']!r}",
+        f"  url        : {probe['url']}",
+        f"  body text  : {probe['bodyLen']} chars",
+        f"  stats container ('.md:hidden.space-y-[2px]'): "
+        f"{'FOUND, ' + str(probe['knownContainerChildren']) + ' rows' if probe['knownContainerFound'] else 'NOT FOUND'}",
+    ]
+    if probe["exactRankText"]:
+        lines.append("  elements whose text is exactly a rank name:")
+        for e in probe["exactRankText"]:
+            lines.append(f"    <{e['tag']} role={e['role']!r} class={e['cls']!r}> {e['text']!r} "
+                         f"(parent <{e['parentTag']} class={e['parentCls']!r}>)")
+    else:
+        lines.append("  NO element has a rank name as its exact text -- the labels themselves changed.")
+    if probe["selects"]:
+        lines.append("  <select> elements:")
+        for sel in probe["selects"]:
+            lines.append(f"    class={sel['cls']!r} options={sel['options']}")
+    lines.append(f"  buttons on page ({len(probe['buttons'])} shown):")
+    for b in probe["buttons"][:18]:
+        lines.append(f"    text={b['text']!r} aria={b['aria']!r} class={b['cls']!r}")
+    if probe["roles"]:
+        lines.append(f"  tab/option/menuitem roles ({len(probe['roles'])}):")
+        for r in probe["roles"][:12]:
+            lines.append(f"    <{r['tag']} role={r['role']!r}> {r['text']!r} class={r['cls']!r}")
+    if probe["bigLists"]:
+        lines.append("  candidate stats containers (50+ children):")
+        for c in probe["bigLists"]:
+            lines.append(f"    <{c['tag']} class={c['cls']!r}> {c['children']} children")
+    return "\n".join(lines)
+
+
 def _click_rank_filter(page: "Page", rank_label: str, timeout_ms: int) -> None:
-    button = page.get_by_role("button", name=rank_label, exact=True)
-    button.wait_for(state="visible", timeout=timeout_ms)
-    button.click()
+    """Click the rank-bracket filter, trying several markup shapes before giving up.
+
+    The original single strategy (role=button with an exact accessible name) broke when the site
+    changed its filter markup, and the scheduled job then failed identically every day for three
+    weeks. Each strategy below is a different plausible shape for the same control; the first one
+    that becomes visible wins. If all of them miss, the error carries a dump of what the page
+    actually offers, so the fix is a log read rather than a guessing game.
+    """
+    per_try = max(2_000, timeout_ms // 5)
+    attempts = [
+        ("role=button exact", lambda: page.get_by_role("button", name=rank_label, exact=True)),
+        ("role=tab exact", lambda: page.get_by_role("tab", name=rank_label, exact=True)),
+        ("role=option exact", lambda: page.get_by_role("option", name=rank_label, exact=True)),
+        ("role=radio exact", lambda: page.get_by_role("radio", name=rank_label, exact=True)),
+        ("aria-label", lambda: page.locator(f'[aria-label="{rank_label}"]')),
+        ("exact text", lambda: page.get_by_text(rank_label, exact=True)),
+    ]
+
+    errors = []
+    for name, build in attempts:
+        try:
+            locator = build().first
+            locator.wait_for(state="visible", timeout=per_try)
+            locator.click()
+            if name != "role=button exact":
+                print(f"NOTE: rank filter {rank_label!r} matched via '{name}', not the primary "
+                      f"'role=button exact' selector -- the page markup has changed. Worth updating "
+                      f"_click_rank_filter's first strategy.", file=sys.stderr)
+            return
+        except Exception as exc:  # locator miss, not visible, intercepted click, detached node
+            errors.append(f"{name}: {type(exc).__name__}")
+
+    # A <select> is a different interaction, so it gets its own attempt rather than a click.
+    try:
+        select = page.locator("select").first
+        select.wait_for(state="visible", timeout=per_try)
+        select.select_option(label=rank_label)
+        print(f"NOTE: rank filter {rank_label!r} set via a <select>, not a button.", file=sys.stderr)
+        return
+    except Exception as exc:
+        errors.append(f"select_option: {type(exc).__name__}")
+
+    try:
+        probe = _format_probe(page.evaluate(_PROBE_JS))
+    except Exception as exc:
+        probe = f"  (page probe also failed: {exc})"
+
+    raise RuntimeError(
+        f"Could not find the {rank_label!r} rank filter. Tried: {', '.join(errors)}.\n"
+        f"What the page actually offers right now:\n{probe}\n"
+        f"Update _click_rank_filter / _EXTRACT_JS in {os.path.basename(__file__)} to match, then "
+        f"re-run. Nothing was written."
+    )
+
+
+def diagnose(headless: bool = True, timeout_ms: int = 30_000, dump_html: str | None = None) -> dict:
+    """Open the stats page and report what it offers, without writing anything.
+
+    This is the thing to run when collection has been failing: it answers "what does the page
+    look like now" in one go, including whether the stats table container still matches.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise RuntimeError(
+            "Playwright is not installed. Run `pip install -r requirements.txt && "
+            "playwright install --with-deps chromium` (menu option 16)."
+        ) from exc
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=headless)
+        page = browser.new_page()
+        try:
+            page.goto(STATS_URL, wait_until="domcontentloaded", timeout=timeout_ms)
+            page.wait_for_timeout(2500)
+            probe = page.evaluate(_PROBE_JS)
+            if dump_html:
+                os.makedirs(os.path.dirname(dump_html) or ".", exist_ok=True)
+                with open(dump_html, "w", encoding="utf-8") as f:
+                    f.write(page.content())
+                print(f"Wrote page HTML -> {dump_html}")
+        finally:
+            browser.close()
+
+    print(f"Diagnostic probe of {STATS_URL}\n")
+    print(_format_probe(probe))
+    print()
+    if probe["knownContainerFound"] and probe["exactRankText"]:
+        print("Both the rank labels and the stats container are present -- a scrape should work.")
+    elif not probe["exactRankText"]:
+        print("The rank filter labels are gone. _click_rank_filter needs a new strategy.")
+    elif not probe["knownContainerFound"]:
+        print("Rank labels found but the stats container selector missed. _EXTRACT_JS needs updating "
+              "-- see the candidate containers above.")
+    return probe
 
 
 def fetch_stats(
@@ -355,6 +532,13 @@ def main() -> None:
     daily_parser.add_argument("--output-dir", default=DAILY_DIR_DEFAULT)
     daily_parser.add_argument("--no-headless", action="store_true", help="Run with a visible browser (local debugging only).")
 
+    diag_parser = subparsers.add_parser(
+        "diagnose",
+        help="Open the stats page and report what rank controls / containers it has. Writes no data.",
+    )
+    diag_parser.add_argument("--dump-html", help="Also save the page HTML here.")
+    diag_parser.add_argument("--no-headless", action="store_true")
+
     snap_parser = subparsers.add_parser(
         "snapshot",
         help="Unlimited collection: archive one or many ranks to data/archive/, optionally on a repeating interval.",
@@ -403,7 +587,9 @@ def main() -> None:
     args = parser.parse_args()
 
     try:
-        if args.mode == "daily":
+        if args.mode == "diagnose":
+            diagnose(headless=not args.no_headless, dump_html=args.dump_html)
+        elif args.mode == "daily":
             save_daily_snapshot(output_dir=args.output_dir, rank=args.rank, headless=not args.no_headless)
         elif args.mode == "snapshot":
             ranks = list(store.RANKS) if args.ranks == "all" else [r.strip() for r in args.ranks.split(",") if r.strip()]

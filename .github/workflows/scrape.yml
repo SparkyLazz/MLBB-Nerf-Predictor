@@ -4,8 +4,10 @@ name: Scrape MLBB Patch Stats
 # - schedule: unattended daily archive, unlabeled (patch_id/patch_date blank). Writes to
 #   data/archive/<rank>/ for every rank bracket, and mirrors Mythic into data/daily/<date>.csv
 #   so the legacy layout stays correct. Never touches data/patches.csv.
-# - workflow_dispatch: the ONLY way a new patch gets recorded in data/patches.csv. Requires a
-#   human to type in patch_id/patch_date -- the script never guesses them.
+# - workflow_dispatch: pick a mode. "snapshot" collects now (use this to restart collection or
+#   check a scraper fix), "diagnose" reports what the stats page offers without writing anything,
+#   and "labeled" records a patch in data/patches.csv -- still the ONLY way a patch gets recorded,
+#   and still requiring a human to type in patch_id/patch_date, which no script ever guesses.
 #
 # Patch notes are deliberately NOT synced on a schedule. scripts/patchnotes.py can read them,
 # but recording a patch stays a human decision, so it is only ever run by hand.
@@ -14,12 +16,27 @@ on:
     - cron: "0 15 * * *" # 15:00 UTC = 22:00 WIB
   workflow_dispatch:
     inputs:
+      mode:
+        description: "What to run"
+        required: true
+        default: "snapshot"
+        type: choice
+        options:
+          # Collect now. This is what you want to restart collection or verify a scraper fix.
+          - snapshot
+          # Report what the stats page currently offers, write nothing. Run this when
+          # collection has been failing and you need to know why.
+          - diagnose
+          # Record a patch in data/patches.csv. Requires patch_id and patch_date below.
+          - labeled
       patch_id:
-        description: "Patch version, e.g. 2.1.92"
-        required: true
+        description: "Patch version, e.g. 2.2.16 (only for mode=labeled)"
+        required: false
+        default: ""
       patch_date:
-        description: "Patch release date, YYYY-MM-DD"
-        required: true
+        description: "Patch release date, YYYY-MM-DD (only for mode=labeled)"
+        required: false
+        default: ""
       nerfed:
         description: "Pipe-separated nerfed heroes (optional, e.g. Baxia|Akai). Leave blank to fill in later."
         required: false
@@ -78,11 +95,37 @@ jobs:
             --daily-dir data/daily \
             --once-per-day
 
+      # Manual collection, for restarting after an outage or confirming a scraper fix.
+      - name: Scrape snapshots on demand (workflow_dispatch, mode=snapshot)
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'snapshot'
+        run: |
+          python scripts/scraper.py snapshot \
+            --ranks "${{ env.DAILY_RANKS }}" \
+            --archive-dir data/archive \
+            --daily-dir data/daily
+
+      # Writes nothing: just reports what the page offers, so a broken selector is one log read.
+      - name: Diagnose the stats page (workflow_dispatch, mode=diagnose)
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'diagnose'
+        run: python scripts/scraper.py diagnose --dump-html /tmp/stats-page.html
+
+      - name: Upload the diagnosed page HTML
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'diagnose'
+        uses: actions/upload-artifact@v4
+        with:
+          name: stats-page-html
+          path: /tmp/stats-page.html
+          if-no-files-found: warn
+
       # Recording a patch is exclusive to workflow_dispatch. patch_id/patch_date always come from
       # the human-filled workflow inputs -- never guessed.
-      - name: Record labeled patch (workflow_dispatch only)
-        if: github.event_name == 'workflow_dispatch'
+      - name: Record labeled patch (workflow_dispatch, mode=labeled)
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'labeled'
         run: |
+          if [ -z "${{ inputs.patch_id }}" ] || [ -z "${{ inputs.patch_date }}" ]; then
+            echo "mode=labeled needs both patch_id and patch_date. Nothing written." >&2
+            exit 1
+          fi
           python scripts/scraper.py labeled \
             --patch-id "${{ inputs.patch_id }}" \
             --patch-date "${{ inputs.patch_date }}" \
@@ -106,10 +149,10 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A data/ || true
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.mode }}" = "labeled" ]; then
             MSG="Record MLBB patch ${{ inputs.patch_id }}"
           else
-            MSG="Add MLBB daily snapshot $(date -u +%Y-%m-%d)"
+            MSG="Add MLBB snapshot $(date -u +%Y-%m-%dT%H%M%SZ)"
           fi
           git diff --cached --quiet || git commit -m "$MSG"
           git push
