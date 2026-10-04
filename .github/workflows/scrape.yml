@@ -138,13 +138,13 @@ jobs:
       # Derived artifacts, rebuilt from the archive every run so they never drift. train.csv is
       # committed; features.csv is gitignored (it is large and fully reproducible).
       - name: Rebuild derived datasets
-        if: success()
+        if: success() && inputs.mode != 'diagnose' 
         run: |
           python scripts/promote.py || echo "promote.py skipped (no snapshot inside a patch window yet)"
           python scripts/dataset.py || echo "dataset.py skipped"
 
       - name: Commit updated data
-        if: success()
+        if: success() && inputs.mode != 'diagnose' 
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"

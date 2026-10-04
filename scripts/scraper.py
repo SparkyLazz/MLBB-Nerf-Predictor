@@ -185,8 +185,151 @@ def _format_probe(probe: dict) -> str:
     return "\n".join(lines)
 
 
+def _select_rank_listbox(page: "Page", rank_label: str, timeout_ms: int) -> bool:
+    """Select a rank from the redesigned page's listbox dropdown.
+
+    The 2026 redesign replaced the row of rank buttons with a combobox:
+
+        <button aria-haspopup="listbox" aria-controls="...-list">
+          <span class="sr-only">Rank</span><span>All Ranks</span>
+        <ul role="listbox" aria-label="Rank">
+          <li role="option" aria-selected="true"><span>All Ranks</span>
+          <li role="option"><span>Epic</span> ... <span>Mythical Glory</span>
+
+    Two consequences beyond the selector change: the control has to be *opened* before any rank
+    is clickable (which is why every single-step strategy missed it), and the page now defaults
+    to "All Ranks" -- so not selecting a rank silently yields blended data rather than Mythic.
+    """
+    trigger = None
+    for candidate in (
+        'button[aria-haspopup="listbox"]:has(span.sr-only:text-is("Rank"))',
+        'button[aria-haspopup="listbox"]:has-text("Rank")',
+        '[role="combobox"]:has-text("Rank")',
+    ):
+        try:
+            locator = page.locator(candidate).first
+            locator.wait_for(state="visible", timeout=max(2_000, timeout_ms // 6))
+            trigger = locator
+            break
+        except Exception:
+            continue
+    if trigger is None:
+        return False
+
+    # Matching the option is where this is easy to get silently wrong. The option's text sits in
+    # a nested <span>, so Playwright's :text-is() binds to the span rather than the <li>; and
+    # :has-text() is a substring match, so "Mythic" also matches "Mythical Honor" and "Mythical
+    # Glory" -- which would scrape a different bracket and label it mythic. Exact accessible-name
+    # matching is the only form verified to select Mythic and nothing else.
+    for build_option in (
+        lambda: page.get_by_role("option", name=rank_label, exact=True),
+        lambda: page.locator(f'[role="option"]:has(span:text-is("{rank_label}"))'),
+    ):
+        try:
+            trigger.click()
+            option = build_option().first
+            option.wait_for(state="visible", timeout=max(2_000, timeout_ms // 6))
+            option.click()
+            page.wait_for_timeout(400)
+            return True
+        except Exception:
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                pass
+            continue
+
+    # Leave the dropdown closed so the legacy strategies start from a clean page.
+    try:
+        page.keyboard.press("Escape")
+    except Exception:
+        pass
+    return False
+
+
+# The redesigned stats table. Resolves columns by their header text rather than by position,
+# so adding a column (the redesign added TIER and TREND) doesn't shift the numbers being read.
+_EXTRACT_TABLE_JS = r"""
+() => {
+  const squash = t => (t || '').replace(/\s+/g, ' ').trim();
+  const ROLES = ['tank', 'fighter', 'assassin', 'mage', 'marksman', 'support'];
+
+  let best = null;
+  for (const t of document.querySelectorAll('table')) {
+    const rows = Array.from(t.querySelectorAll('tbody tr'));
+    if (!best || rows.length > best.rows.length) best = { table: t, rows };
+  }
+  if (!best || !best.rows.length) {
+    return { error: 'no <table> with tbody rows found', tables: document.querySelectorAll('table').length };
+  }
+
+  const heads = Array.from(best.table.querySelectorAll('thead th, thead td'))
+    .map(c => squash(c.innerText).toUpperCase());
+  const col = needle => heads.findIndex(h => h.includes(needle));
+  const iHero = col('HERO'), iWin = col('WIN'), iPick = col('PICK'), iBan = col('BAN');
+  if (iWin < 0 || iPick < 0 || iBan < 0) {
+    return { error: 'could not find WIN/PICK/BAN columns by header text', heads };
+  }
+
+  // "53.2%" / "53.2" / "+0.4" -> first number. Rejects a cell that holds no number at all.
+  const num = text => { const m = squash(text).match(/-?\d+(?:\.\d+)?/); return m ? m[0] : null; };
+
+  const data = best.rows.map(tr => {
+    const cells = Array.from(tr.children);
+    const at = i => (i >= 0 && cells[i]) ? squash(cells[i].innerText) : '';
+    const heroCell = cells[iHero >= 0 ? iHero : 0];
+
+    let name = null;
+    if (heroCell) {
+      const link = heroCell.querySelector('a');
+      name = squash((link || heroCell).innerText).split(' ').length > 6
+        ? squash((link || heroCell).innerText).slice(0, 40)
+        : squash((link || heroCell).innerText);
+    }
+
+    // Role is no longer its own column. Look for it in an image alt, then in the hero cell's
+    // text, then in any cell whose whole text is a role name.
+    let role = null;
+    if (heroCell) {
+      for (const img of heroCell.querySelectorAll('img[alt]')) {
+        const cand = img.alt.toLowerCase().replace(/ (hero )?icon$/, '').trim();
+        if (ROLES.includes(cand)) { role = cand; break; }
+      }
+      if (!role) {
+        const lower = squash(heroCell.innerText).toLowerCase();
+        role = ROLES.find(r => lower.includes(r)) || null;
+      }
+    }
+    if (!role) {
+      for (const c of cells) {
+        const lower = squash(c.innerText).toLowerCase();
+        if (ROLES.includes(lower)) { role = lower; break; }
+      }
+    }
+
+    return { name, role, win: num(at(iWin)), pick: num(at(iPick)), ban: num(at(iBan)) };
+  });
+
+  return { count: data.length, data, heads, layout: 'table' };
+}
+"""
+
+
+def _roles_from_archive() -> dict[str, str]:
+    """hero -> role from the most recent snapshot that has roles. Empty dict if unavailable."""
+    try:
+        long_df = store.load_snapshots()
+        if long_df.empty:
+            return {}
+        latest = long_df[long_df["ts"] == long_df["ts"].max()]
+        roles = latest.loc[latest["role"].notna() & (latest["role"] != "unknown"), ["hero", "role"]]
+        return dict(zip(roles["hero"], roles["role"]))
+    except Exception:
+        return {}
+
+
 def _click_rank_filter(page: "Page", rank_label: str, timeout_ms: int) -> None:
-    """Click the rank-bracket filter, trying several markup shapes before giving up.
+    """Select the rank-bracket filter, trying several markup shapes before giving up.
 
     The original single strategy (role=button with an exact accessible name) broke when the site
     changed its filter markup, and the scheduled job then failed identically every day for three
@@ -194,6 +337,10 @@ def _click_rank_filter(page: "Page", rank_label: str, timeout_ms: int) -> None:
     that becomes visible wins. If all of them miss, the error carries a dump of what the page
     actually offers, so the fix is a log read rather than a guessing game.
     """
+    # The current site shape first: a listbox that must be opened before its options exist.
+    if _select_rank_listbox(page, rank_label, timeout_ms):
+        return
+
     per_try = max(2_000, timeout_ms // 5)
     attempts = [
         ("role=button exact", lambda: page.get_by_role("button", name=rank_label, exact=True)),
@@ -210,10 +357,9 @@ def _click_rank_filter(page: "Page", rank_label: str, timeout_ms: int) -> None:
             locator = build().first
             locator.wait_for(state="visible", timeout=per_try)
             locator.click()
-            if name != "role=button exact":
-                print(f"NOTE: rank filter {rank_label!r} matched via '{name}', not the primary "
-                      f"'role=button exact' selector -- the page markup has changed. Worth updating "
-                      f"_click_rank_filter's first strategy.", file=sys.stderr)
+            print(f"NOTE: rank filter {rank_label!r} matched via the legacy '{name}' strategy, not "
+                  f"the listbox dropdown -- the page markup changed again. Worth revisiting "
+                  f"_select_rank_listbox.", file=sys.stderr)
             return
         except Exception as exc:  # locator miss, not visible, intercepted click, detached node
             errors.append(f"{name}: {type(exc).__name__}")
@@ -433,7 +579,17 @@ def fetch_stats(
             # The filter re-render is client-side and can briefly show stale rows mid-transition.
             page.wait_for_timeout(500)
 
-            result = page.evaluate(_EXTRACT_JS)
+            # Current layout first, then the pre-redesign container, so an old mirror or a
+            # rollback still scrapes rather than failing outright.
+            result = page.evaluate(_EXTRACT_TABLE_JS)
+            if "error" in result:
+                table_error = result
+                result = page.evaluate(_EXTRACT_JS)
+                if "error" in result:
+                    result = {"error": f"table layout: {table_error}; legacy layout: {result}"}
+                else:
+                    print("NOTE: scraped via the pre-redesign container, not the <table> layout.",
+                          file=sys.stderr)
         finally:
             browser.close()
 
@@ -456,8 +612,26 @@ def fetch_stats(
             f"Collection continues; bump EXPECTED_HERO_COUNT in {os.path.basename(__file__)} to silence this.",
             file=sys.stderr,
         )
-    if df[["name", "role", "win", "pick", "ban"]].isnull().any().any():
-        bad = df[df[["name", "role", "win", "pick", "ban"]].isnull().any(axis=1)]
+    # Role moved out of its own column in the redesign, so it can come back empty even when
+    # every rate parsed fine. Rather than discard a good scrape over a field that is constant
+    # per hero, fill it from the roles already in the archive; only a genuinely new hero stays
+    # unknown. The rates -- the actual measurements -- are never filled in like this.
+    if df["role"].isnull().any():
+        filled = _roles_from_archive()
+        if filled:
+            df["role"] = df["role"].fillna(df["name"].map(filled))
+        still_missing = df["role"].isnull()
+        if still_missing.any():
+            print(
+                f"WARNING: no role for {sorted(df.loc[still_missing, 'name'])} -- not on the page "
+                "and not in the archive (new hero?). Recording them as 'unknown'; role-relative "
+                "features will treat them as their own cohort until it is corrected.",
+                file=sys.stderr,
+            )
+            df["role"] = df["role"].fillna("unknown")
+
+    if df[["name", "win", "pick", "ban"]].isnull().any().any():
+        bad = df[df[["name", "win", "pick", "ban"]].isnull().any(axis=1)]
         raise RuntimeError(f"Scrape returned incomplete rows, refusing to proceed:\n{bad}")
     if df["name"].duplicated().any():
         dupes = df[df["name"].duplicated(keep=False)]
