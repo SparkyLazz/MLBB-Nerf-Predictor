@@ -268,8 +268,61 @@ python scripts/trends.py compare 2026-08-04 2026-09-12 --by d_ban
 python scripts/selftest.py -v
 ```
 
+## When collection stops
+
+It already happened once, and the way it happened is worth knowing about: between 2026-09-12 and
+2026-10-04 the scheduled job **ran every single day and failed every single day** — ten
+consecutive `failure` runs — always at the same line:
+
+```
+TimeoutError: Locator.wait_for: Timeout 30000ms exceeded.
+  - waiting for get_by_role("button", name="Mythic", exact=True) to be visible
+```
+
+mlbbhub changed its rank-filter markup. The page still loaded; only the one hard-coded selector
+stopped matching. Three weeks of data was lost to that, and nothing surfaced it — the archive
+just quietly stopped growing while the cron kept green-lighting itself into the same crash.
+
+Two changes so this is cheaper next time:
+
+- **The scraper tries seven markup shapes** for the rank filter (`role=button`, `role=tab`,
+  `role=option`, `role=radio`, `aria-label`, exact text, and `<select>` option) and logs which
+  one matched when it isn't the primary, so you know the page drifted before it breaks outright.
+- **When all of them miss, the error dumps the live page**: title, whether the stats container
+  still matches, every element whose text is exactly a rank name, all buttons with their classes
+  and aria-labels, tab/option roles, selects with their options, and any 50+ child container
+  that could be the new stats table. The next breakage should be a one-log-read fix.
+
+To investigate without writing anything:
+
+```bash
+python scripts/scraper.py diagnose                  # what does the page offer right now?
+python scripts/scraper.py diagnose --dump-html /tmp/stats.html
+```
+
+Or run it on GitHub: **Actions → Scrape MLBB Patch Stats → Run workflow → mode: `diagnose`**.
+That prints the same probe and uploads the page HTML as an artifact, which is the fastest way to
+see the live DOM if you can't reach the site locally.
+
+`workflow_dispatch` now takes a **`mode`**:
+
+| mode | what it does |
+|---|---|
+| `snapshot` | collect now, every rank — use this to restart collection or confirm a fix |
+| `diagnose` | report what the page offers, write nothing |
+| `labeled` | record a patch in `data/patches.csv` (needs `patch_id` + `patch_date`) |
+
+Before, `labeled` was the *only* manual run and both patch fields were mandatory — so there was
+no way to collect on demand, or to test a scraper fix, without also recording a patch.
+
+Note the daily cron runs on the **default branch**, so a scraper fix only reaches scheduled
+collection once it's merged there.
+
 ## Per-patch workflow
 
+0. **Check the Action is actually passing.** It is the single point of failure for everything
+   else here, it fails silently, and option 13 (archive health) is what tells you the archive
+   stopped growing. See "When collection stops" above.
 1. **Every day**, the scheduled GitHub Action (`0 15 * * *` UTC / 22:00 WIB) collects a snapshot
    for every rank bracket, rebuilds the derived datasets, and commits. Narrow `DAILY_RANKS` in
    the workflow if five brackets a day is more than you want.
