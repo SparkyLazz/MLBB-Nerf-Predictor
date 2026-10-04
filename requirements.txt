@@ -1,3 +1,5 @@
 pandas>=2.0
 numpy>=1.26
 playwright>=1.44
+scikit-learn>=1.4
+joblib>=1.3
