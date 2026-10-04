@@ -43,14 +43,37 @@ LABEL = "nerfed_next"
 
 
 def label_snapshots(feat: pd.DataFrame, patches: pd.DataFrame) -> pd.DataFrame:
-    """Attach ``nerfed_next`` (and which patch supplied it) to every feature row."""
+    """Attach ``nerfed_next`` (and which patch supplied it) to every feature row.
+
+    A patch recorded with an EMPTY heroes_nerfed list means "we haven't filled this in yet", not
+    "this patch nerfed nobody". Those two readings are indistinguishable in the CSV, and taking
+    the second one turns a whole window of heroes into confident negatives -- false negatives
+    that teach the model the opposite of the truth, silently. So an empty next-patch nerf list
+    leaves the window UNLABELED and warns, rather than labelling it all zeros. Fill the list in
+    (menu option 4) and the window becomes trainable on the next rebuild.
+    """
     cal = patches.sort_values("release_date").reset_index(drop=True)
 
     next_id: dict[str, str] = {}
     next_nerfs: dict[str, set[str]] = {}
+    blank_next: dict[str, str] = {}
     for i in range(len(cal) - 1):
-        next_id[cal.loc[i, "patch_id"]] = cal.loc[i + 1, "patch_id"]
-        next_nerfs[cal.loc[i, "patch_id"]] = cal.loc[i + 1, "nerf_set"]
+        this_id, next_patch_id = cal.loc[i, "patch_id"], cal.loc[i + 1, "patch_id"]
+        next_id[this_id] = next_patch_id
+        if cal.loc[i + 1, "nerf_set"]:
+            next_nerfs[this_id] = cal.loc[i + 1, "nerf_set"]
+        else:
+            blank_next[this_id] = next_patch_id
+
+    for this_id, next_patch_id in blank_next.items():
+        n_rows = int((feat["patch_id"] == this_id).sum())
+        if n_rows:
+            print(
+                f"WARNING: patch {next_patch_id} has an empty heroes_nerfed list, so the "
+                f"{n_rows} row(s) collected during {this_id} stay UNLABELED rather than being "
+                f"recorded as 'nobody was nerfed'. Fill in {next_patch_id}'s nerf list to use them.",
+                file=sys.stderr,
+            )
 
     feat = feat.copy()
     feat["next_patch_id"] = feat["patch_id"].map(next_id).fillna("")
